@@ -1,9 +1,10 @@
-import torch
-import random
 import copy
 import numpy as np
+import random
+import torch
 from torch import nn
 import torch.nn.functional as F
+
 
 
 def seed_everything(seed=42):
@@ -45,7 +46,6 @@ def compute_batch_nll(model, inputs):
     loss = loss_function(logits.transpose(-1, -2), shifted_labels).sum(dim=-1)
     return loss, outputs
 
-# Utility functions for different unlearning loss computations
 
 def prepare_ref_model(self, model):
     ref_model = copy.deepcopy(model).to(self.accelerator.device)
@@ -75,6 +75,8 @@ def compute_retain_loss(model, retain_inputs, retain_loss_type="NLL"):
         )
     return retain_loss
 
+
+# Loss Functions for Forgetting Methods
 
 def compute_dpo_loss(model, ref_model, win_inputs=None, lose_inputs=None, beta=0.1):
     if win_inputs is None and lose_inputs is None:
