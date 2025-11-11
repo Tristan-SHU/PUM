@@ -266,12 +266,11 @@ def sample_ffn_permutation(
     behavior, sample the permutation indices on the CPU and then construct P on the target device.
     """
     g = torch.Generator(device="cpu")
-    g.manual_seed(int(seed) & ((1 << 64) - 1))
-    idx_cpu = torch.randperm(d_ff, generator=g, device="cpu")  # [d_ff], long
-
-    eye = torch.eye(d_ff, device=device, dtype=dtype)
-    P_ffn = eye.index_select(0, idx_cpu.to(device))  # P = I[idx]
-    return P_ffn
+    g.manual_seed(int(seed) & ((1<<64)-1))
+    idx = torch.randperm(d_ff, generator=g, device=device)
+    P = torch.zeros(d_ff, d_ff, device=device, dtype=dtype)
+    P.scatter_(1, idx.view(-1,1), 1.0)
+    return P
 
 
 # Memory Saving Version
@@ -336,7 +335,9 @@ def harmonic_aggregate(delta_list: List[OrderedDict], alphas: List[float]) -> Or
     Compute the harmonic weighted average of m update tensors using weights w_k = 1/alpha_k.
     For numerical stability, all tensors are accumulated in float32 and converted back to their original dtype upon return.
     """
-    assert len(delta_list) == len(alphas) and len(delta_list) > 0
+    assert len(delta_list) == len(alphas) and len(delta_list) > 0, \
+        f"delta_list({len(delta_list)}) and alphas({len(alphas)}) must have the same non-zero length"
+
     weights = [1.0 / float(a) for a in alphas]
     S0 = float(sum(weights))
 
@@ -345,18 +346,17 @@ def harmonic_aggregate(delta_list: List[OrderedDict], alphas: List[float]) -> Or
 
     for name in keys:
         v0 = delta_list[0][name]
+
         if not torch.is_tensor(v0):
             out[name] = v0
             continue
 
-        device = v0.device
-        # Initialize an accumulator of dtype float32 with the same shape and device as the tensors to be aggregated
-        acc = torch.zeros_like(v0, dtype=torch.float32, device=device)
-
-        # Accumulate per-replica updates: cast each tensor to float32, then add it into the accumulator scaled by its corresponding weight
+        acc = torch.zeros_like(v0, dtype=torch.float32, device=v0.device)
+        
         for i, d in enumerate(delta_list):
-            if torch.is_tensor(d[name]):
-                acc.add_(d[name].to(torch.float32), alpha=weights[i])
+            vi = d[name]
+            if torch.is_tensor(vi):
+                acc.add_(vi.to(torch.float32), alpha=weights[i])
 
         res = acc / S0
         out[name] = res.to(v0.dtype)

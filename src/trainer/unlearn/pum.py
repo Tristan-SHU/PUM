@@ -43,7 +43,7 @@ class PUMConfig:
     rope_aware: bool = False
 
     # Client Local Unlearning (First-order Small Steps)
-    client_method: Literal["GrandAscent", "GradDiff", "DPO", "NPO", "SimNPO", "SatImp", "UnDIAL", "WGA"] = "GrandAscent"
+    client_method: Literal["GradAscent", "GradDiff", "DPO", "NPO", "SimNPO", "SatImp", "UnDIAL", "WGA"] = "GradAscent"
     client_steps: int = 10
     client_lr: float = 1e-5
 
@@ -122,7 +122,7 @@ class PUM:
         it_r = iter(ul_retain) if ul_retain is not None else None
 
         # Hyperparameters (fall back to defaults defined in the utils functions when not specified in cfg) ----
-        method = str(self.cfg.client_method).lower()
+        method = str(self.cfg.client_method)
         retain_loss_type = getattr(self.cfg, "retain_loss_type", "NLL")
 
         alpha = getattr(self.cfg, "retain_alpha", 1.0)
