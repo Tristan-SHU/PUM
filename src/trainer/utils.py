@@ -1,5 +1,6 @@
 import torch
 import random
+import copy
 import numpy as np
 from torch import nn
 import torch.nn.functional as F
@@ -44,8 +45,38 @@ def compute_batch_nll(model, inputs):
     loss = loss_function(logits.transpose(-1, -2), shifted_labels).sum(dim=-1)
     return loss, outputs
 
+# Utility functions for different unlearning loss computations
 
-def compute_dpo_loss(model, ref_model, win_inputs=None, lose_inputs=None, beta=1.0):
+def prepare_ref_model(self, model):
+    ref_model = copy.deepcopy(model).to(self.accelerator.device)
+    ref_model.eval()
+    if self.is_deepspeed_enabled:
+        ref_model = self._prepare_deepspeed(ref_model)
+    else:
+        ref_model = self.accelerator.prepare_model(ref_model, evaluation_mode=True)
+    return ref_model
+
+def compute_retain_loss(model, retain_inputs, retain_loss_type="NLL"):
+    ref_model = None
+    if retain_loss_type == "KL":
+        ref_model = prepare_ref_model(model)
+    retain_outputs = model(**retain_inputs)
+    retain_loss = 0.0
+    if retain_loss_type == "NLL":
+        retain_loss += retain_outputs.loss
+    elif retain_loss_type == "KL":
+        kl_loss, retain_outputs = compute_kl_divergence(
+            model, ref_model, retain_inputs
+        )
+        retain_loss += kl_loss
+    else:
+        raise NotImplementedError(
+            f"{retain_loss_type} not implemented for retain set"
+        )
+    return retain_loss
+
+
+def compute_dpo_loss(model, ref_model, win_inputs=None, lose_inputs=None, beta=0.1):
     if win_inputs is None and lose_inputs is None:
         raise ValueError("Both win_inputs and lose_inputs can't be None")
 
@@ -133,3 +164,176 @@ def compute_satimp_loss(model, inputs, beta1, beta2):
         shift_labels.view(-1) != -100
     ].mean()
     return forget_loss, outputs
+
+
+def compute_gradascent(model, inputs):
+    forget_inputs = inputs["forget"]
+    forget_inputs = {
+        "input_ids": forget_inputs["input_ids"],
+        "attention_mask": forget_inputs["attention_mask"],
+        "labels": forget_inputs["labels"],
+    }
+    outputs = model(**forget_inputs)
+    loss = -outputs.loss
+    return loss, outputs
+
+
+def compute_graddiff(model, inputs, gamma=1.0, alpha=1.0, retain_loss_type="NLL"):
+    forget_inputs = inputs["forget"]
+    forget_inputs = {
+        "input_ids": forget_inputs["input_ids"],
+        "attention_mask": forget_inputs["attention_mask"],
+        "labels": forget_inputs["labels"],
+    }
+
+    forget_outputs = model(**forget_inputs)
+    forget_loss = -forget_outputs.loss
+
+    retain_inputs = inputs["retain"]
+    retain_inputs = {
+        "input_ids": retain_inputs["input_ids"],
+        "attention_mask": retain_inputs["attention_mask"],
+        "labels": retain_inputs["labels"],
+    }
+    retain_loss = compute_retain_loss(model=model, retain_inputs=retain_inputs, retain_loss_type=retain_loss_type)
+
+    loss = gamma * forget_loss + alpha * retain_loss
+
+    return loss, forget_outputs
+
+
+def compute_dpo(model, inputs, alpha=1.0, beta=0.1, gamma=1.0, retain_loss_type="NLL"):
+    ref_model = prepare_ref_model(model)
+    forget_inputs = inputs["forget"]["original"]
+    alternate_inputs = inputs["forget"]["alternate"]
+
+    forget_loss, forget_outputs = compute_dpo_loss(
+        model=model,
+        ref_model=ref_model,
+        win_inputs=alternate_inputs,
+        lose_inputs=forget_inputs,
+        beta=beta,
+    )
+
+    retain_inputs = inputs["retain"]
+    retain_inputs = {
+        "input_ids": retain_inputs["input_ids"],
+        "attention_mask": retain_inputs["attention_mask"],
+        "labels": retain_inputs["labels"],
+    }
+    retain_loss = compute_retain_loss(model=model, retain_inputs=retain_inputs, retain_loss_type=retain_loss_type)
+
+    loss = gamma * forget_loss + alpha * retain_loss
+    return loss, forget_outputs
+
+
+def compute_npo(model, inputs, alpha=1.0, beta=0.1, gamma=1.0, return_outputs=False):
+    ref_model = prepare_ref_model(model)
+    forget_inputs = inputs["forget"]
+
+    forget_loss, forget_outputs = compute_dpo_loss(
+        model=model,
+        ref_model=ref_model,
+        win_inputs=None,
+        lose_inputs=forget_inputs,
+        beta=beta,
+    )
+
+    retain_inputs = inputs["retain"]
+    retain_inputs = {
+        "input_ids": retain_inputs["input_ids"],
+        "attention_mask": retain_inputs["attention_mask"],
+        "labels": retain_inputs["labels"],
+    }
+    retain_loss = compute_retain_loss(model=model, retain_inputs=retain_inputs, retain_loss_type="NLL")
+
+    loss = gamma * forget_loss + alpha * retain_loss
+    return loss, forget_outputs
+
+
+def compute_simnpo(model, inputs, alpha=1.0, beta=4.5, delta=0.0, gamma=0.125, retain_loss_type="NLL"):
+    forget_inputs = inputs["forget"]
+
+    forget_labels = forget_inputs["labels"]
+    loss_mask = forget_labels != -100
+    forget_loss, forget_outputs = compute_batch_nll(model, forget_inputs)
+    forget_loss = forget_loss / loss_mask.sum(-1) - delta
+    forget_loss = -F.logsigmoid(beta * forget_loss).mean() * 2 / beta
+
+    retain_inputs = inputs["retain"]
+    retain_inputs = {
+        "input_ids": retain_inputs["input_ids"],
+        "attention_mask": retain_inputs["attention_mask"],
+        "labels": retain_inputs["labels"],
+    }
+    retain_loss = compute_retain_loss(model=model, retain_inputs=retain_inputs, retain_loss_type=retain_loss_type)
+
+    loss = gamma * forget_loss + alpha * retain_loss
+    return loss, forget_outputs
+
+
+def compute_satimp(model, inputs, alpha=1.0, beta1=5.0, beta2=1.0, gamma=0.1, retain_loss_type="NLL"):
+    forget_inputs = inputs["forget"]
+    forget_inputs = {
+        "input_ids": forget_inputs["input_ids"],
+        "attention_mask": forget_inputs["attention_mask"],
+        "labels": forget_inputs["labels"],
+    }
+    forget_loss, forget_outputs = compute_satimp_loss(
+        model=model, inputs=forget_inputs, beta1=beta1, beta2=beta2
+    )
+
+    retain_inputs = inputs["retain"]
+    retain_inputs = {
+        "input_ids": retain_inputs["input_ids"],
+        "attention_mask": retain_inputs["attention_mask"],
+        "labels": retain_inputs["labels"],
+    }
+    retain_loss = compute_retain_loss(model=model, retain_inputs=retain_inputs, retain_loss_type=retain_loss_type)
+
+    loss = gamma * forget_loss + alpha * retain_loss
+    return loss, forget_outputs
+
+
+def compute_undial(model, inputs, alpha=0.0, beta=10.0, gamma=1.0, retain_loss_type="NLL"):
+    ref_model = prepare_ref_model(model)
+    forget_inputs = inputs["forget"]
+    forget_loss, forget_outputs = compute_undial_loss(
+        model, ref_model, forget_inputs, beta
+    )
+
+    retain_inputs = inputs["retain"]
+    retain_inputs = {
+        "input_ids": retain_inputs["input_ids"],
+        "attention_mask": retain_inputs["attention_mask"],
+        "labels": retain_inputs["labels"],
+    }
+    retain_loss = compute_retain_loss(model=model, retain_inputs=retain_inputs, retain_loss_type=retain_loss_type)
+
+    loss = gamma * forget_loss + alpha * retain_loss
+    return loss, forget_outputs
+
+
+def compute_wga(model, inputs, alpha=1.0, beta=1.0, gamma=1.0, retain_loss_type="NLL"):
+    forget_inputs = inputs["forget"]
+    forget_inputs = {
+        "input_ids": forget_inputs["input_ids"],
+        "attention_mask": forget_inputs["attention_mask"],
+        "labels": forget_inputs["labels"],
+    }
+    forget_loss, forget_outputs = compute_wga_loss(
+        model=model, inputs=forget_inputs, beta=beta
+    )
+
+    retain_inputs = inputs["retain"]
+    retain_inputs = {
+        "input_ids": retain_inputs["input_ids"],
+        "attention_mask": retain_inputs["attention_mask"],
+        "labels": retain_inputs["labels"],
+    }
+    retain_loss = compute_retain_loss(model=model, retain_inputs=retain_inputs, retain_loss_type=retain_loss_type)
+
+    loss = (
+        gamma * forget_loss + alpha * retain_loss
+    )  # default gamma=1.0 alpha=1.0
+    return loss, forget_outputs
