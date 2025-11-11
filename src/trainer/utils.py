@@ -227,7 +227,7 @@ def compute_dpo(model, inputs, alpha=1.0, beta=0.1, gamma=1.0, retain_loss_type=
     return loss, forget_outputs
 
 
-def compute_npo(model, inputs, alpha=1.0, beta=0.1, gamma=1.0, return_outputs=False):
+def compute_npo(model, inputs, alpha=1.0, beta=0.1, gamma=1.0):
     ref_model = prepare_ref_model(model)
     forget_inputs = inputs["forget"]
 
@@ -245,7 +245,7 @@ def compute_npo(model, inputs, alpha=1.0, beta=0.1, gamma=1.0, return_outputs=Fa
         "attention_mask": retain_inputs["attention_mask"],
         "labels": retain_inputs["labels"],
     }
-    retain_loss = compute_retain_loss(model=model, retain_inputs=retain_inputs, retain_loss_type="NLL")
+    retain_loss = compute_retain_loss(model=model, retain_inputs=retain_inputs)
 
     loss = gamma * forget_loss + alpha * retain_loss
     return loss, forget_outputs
