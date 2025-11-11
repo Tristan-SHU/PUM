@@ -30,7 +30,7 @@ class PUMConfig:
     rope_aware: bool = False
 
     # Client Local Unlearning (First-order Small Steps)
-    client_method: Literal["ga", "npo", "graddiff"] = "ga"
+    client_method: Literal["GrandAscent", "GradDiff", "DPO", "NPO", "SimNPO", "SatImp", "UnDIAL", "WGA"] = "GrandAscent"
     client_steps: int = 10
     client_lr: float = 5e-4
 
@@ -50,7 +50,7 @@ class PUM:
         self.tok = tokenizer
         self.cfg = cfg
 
-    def _alphas(self) -> List[float]:
+    def alphas(self) -> List[float]:
         if self.cfg.alphas is not None:
             assert len(self.cfg.alphas) == self.cfg.m
             return self.cfg.alphas
@@ -60,7 +60,7 @@ class PUM:
         return xs
 
     @torch.no_grad()
-    def _layer_groups(self) -> dict:
+    def layer_groups(self) -> dict:
         """
         Group the `state_dict` keys by transformer layer (parameters within the same layer share the same `σ_l`).
         If your repository already has a more refined layer enumeration function, you can replace this implementation.
@@ -77,10 +77,10 @@ class PUM:
                 groups.setdefault(f"layer{lid}", []).append(k)
         return groups
 
-    def _client_unlearn(self, model_pub, dl_forget, dl_retain=None, ref_model=None, device="cuda"):
+    def client_unlearn(self, model_pub, dl_forget, dl_retain=None, ref_model=None, device="cuda"):
         """
         Minimalist client inner loop: Runs several steps of GradAscent / GradDiff / NPO /... .
-        This can be directly replaced with your existing dedicated Trainer; a minimal implementation is provided here for independence.
+        This can be directly replaced with the existing dedicated Trainer; a minimal implementation is provided here for independence.
         """
         from trainer.utils import compute_retain_loss, compute_npo_loss
         
@@ -129,8 +129,8 @@ class PUM:
 
         # θ_{r-1}
         theta_prev: OrderedDict = copy.deepcopy(self.model.state_dict())
-        alphas = self._alphas()
-        layer_groups = self._layer_groups()
+        alphas = self.alphas()
+        layer_groups = self.layer_groups()
 
         # Read attention hyperparameters from config or model
         H_Q = getattr(self.model.config, "num_attention_heads", 32)
@@ -220,7 +220,7 @@ class PUM:
                 model_k.load_state_dict(pub_sd, strict=False)
 
                 # Line 9–10: The client performs local unlearning steps on D_f (possibly with D_r/ref_model)
-                _ = self._client_unlearn(model_k, dl_forget, dl_retain, ref_model, device=device)
+                _ = self.client_unlearn(model_k, dl_forget, dl_retain, ref_model, device=device)
 
                 # Line 11: Δ' = θ_after - θ_pub
                 after_sd = model_k.state_dict()

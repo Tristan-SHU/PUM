@@ -78,26 +78,28 @@ def generate_zero_sum_noises(
             g.manual_seed(construct_seed64(seed_round, "noise", lk, k))
             for n in names:
                 t = sd_ref[n]
-                z = torch.randn(t.shape, generator=g, device=device, dtype=t.dtype) * sigma
-                Z_per_name[n].append(z)
+                # Sample on CPU to save device memory, then move to target device during addition
+                z_cpu = torch.randn(t.shape, generator=g, device="cpu", dtype=t.dtype) * sigma
+                Z_per_name[n].append(z_cpu)
 
         # Zero-sum normalization: compute ε^0_k = sqrt(m/(m-1)) * (z_k - mean) for each replica k, then scale by α_k
         scale = (m / (m - 1)) ** 0.5
         for n in names:
-            stack = torch.stack(Z_per_name[n], dim=0)  # [m, ...]
-            mean = stack.mean(dim=0)
-            eps0 = (stack - mean) * scale
+            stack_cpu = torch.stack(Z_per_name[n], dim=0)
+            mean_cpu  = stack_cpu.mean(dim=0)
+            eps0_cpu  = (stack_cpu - mean_cpu) * scale
             for k in range(m):
-                noises[k][n].add_(eps0[k] * float(alphas[k]))
+                noises[k][n].add_(eps0_cpu[k].to(device) * float(alphas[k]))
     return noises
 
 
 # Reparameterization: orthogonal / rotation blocks
 def generate_rand_orth_matrix(d: int, gen: torch.Generator, device, dtype):
-    M = torch.randn(d, d, generator=gen, device=device, dtype=dtype)
+    M = torch.randn(d, d, generator=gen, device="cpu", dtype=dtype)
     Q, R = torch.linalg.qr(M)
     s = torch.sign(torch.diag(R))
-    return Q @ torch.diag_embed(s)
+    Q = Q @ torch.diag_embed(s)
+    return Q.to(device=device, dtype=dtype)
 
 
 def construct_rotation_matrix(theta: torch.Tensor):  # [...]->[...,2,2]
@@ -134,21 +136,20 @@ def sample_T_attention(
     blocks_kv = []
     if rope_aware:
         if d_h % 2 != 0:
-            raise ValueError("RoPE-aware mode requires the per-head dimension d_h to be even.")
+            raise ValueError("RoPE-aware mode requires even d_h.")
         for _ in range(H_KV):
-            thetas = torch.rand(d_h // 2, generator=gS, device=device, dtype=dtype) * (2 * math.pi)
-            R_planes = construct_rotation_matrix(thetas)            # [d_h//2, 2, 2]
-            S_j = torch.block_diag(*R_planes.unbind(dim=0))         # [d_h, d_h]
+            thetas_cpu = torch.rand(d_h // 2, generator=gS, device="cpu")
+            R_planes   = construct_rotation_matrix(thetas_cpu).to(device=device, dtype=dtype)
+            S_j        = torch.block_diag(*R_planes.unbind(0))
             blocks_kv.append(S_j)
     else:
         for _ in range(H_KV):
             S_j = generate_rand_orth_matrix(d_h, gS, device=device, dtype=dtype)
             blocks_kv.append(S_j)
 
-    S_KV = torch.block_diag(*blocks_kv).to(device=device, dtype=dtype)
-    idx = [min((i * H_KV) // H_Q, H_KV - 1) for i in range(H_Q)]
-    U_blocks = [blocks_kv[j] for j in idx]
-    U = torch.block_diag(*U_blocks).to(device=device, dtype=dtype)
+    S_KV   = torch.block_diag(*[B.to(device=device, dtype=dtype) for B in blocks_kv])
+    idx    = [min((i * H_KV) // H_Q, H_KV - 1) for i in range(H_Q)]
+    U      = torch.block_diag(*[blocks_kv[j].to(device=device, dtype=dtype) for j in idx])
     return U, S_KV
 
 
@@ -194,7 +195,6 @@ def inverse_T_on_update_attention(
     dW_V = S_KV @ dW_Vp
     dW_O = dW_Op @ U.T
     return dW_Q, dW_K, dW_V, dW_O
-
 
 
 # Forward transformation T for FFN
@@ -273,6 +273,7 @@ def sample_ffn_permutation(
     P_ffn = eye.index_select(0, idx_cpu.to(device))  # P = I[idx]
     return P_ffn
 
+
 # Memory Saving Version
 # @torch.no_grad()
 # def apply_T_attention_weights(
@@ -331,19 +332,33 @@ def sample_ffn_permutation(
 # Harmonic aggregation: aggregate parameter deltas using weights inversely proportional to the provided scaling factors (alphas).
 @torch.no_grad()
 def harmonic_aggregate(delta_list: List[OrderedDict], alphas: List[float]) -> OrderedDict:
-    assert len(delta_list) == len(alphas)
+    """
+    Compute the harmonic weighted average of m update tensors using weights w_k = 1/alpha_k.
+    For numerical stability, all tensors are accumulated in float32 and converted back to their original dtype upon return.
+    """
+    assert len(delta_list) == len(alphas) and len(delta_list) > 0
     weights = [1.0 / float(a) for a in alphas]
-    S0 = sum(weights)
+    S0 = float(sum(weights))
+
     out = OrderedDict()
     keys = delta_list[0].keys()
-    for k in keys:
-        v0 = delta_list[0][k]
+
+    for name in keys:
+        v0 = delta_list[0][name]
         if not torch.is_tensor(v0):
-            out[k] = v0
+            out[name] = v0
             continue
-        acc = None
+
+        device = v0.device
+        # Initialize an accumulator of dtype float32 with the same shape and device as the tensors to be aggregated
+        acc = torch.zeros_like(v0, dtype=torch.float32, device=device)
+
+        # Accumulate per-replica updates: cast each tensor to float32, then add it into the accumulator scaled by its corresponding weight
         for i, d in enumerate(delta_list):
-            term = d[k] * weights[i]
-            acc = term if acc is None else (acc + term)
-        out[k] = acc / S0
+            if torch.is_tensor(d[name]):
+                acc.add_(d[name].to(torch.float32), alpha=weights[i])
+
+        res = acc / S0
+        out[name] = res.to(v0.dtype)
+
     return out
