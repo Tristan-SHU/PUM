@@ -129,7 +129,7 @@ def sample_T_attention(
         analogous to the non-RoPE construction.
     """
     gS = torch.Generator(device="cpu")
-    gS.manual_seed(construct_seed64(seed_round, "T", k_copy, "S"))
+    gS.manual_seed(int(seed_round) & ((1 << 64) - 1))  
 
     blocks_kv = []
     if rope_aware:
@@ -252,6 +252,26 @@ def inverse_T_on_update_ffn(
     db2_down = db2_down_p  # unchanged
 
     return dW1_gate, dW1_up, dW2, db1_gate, db1_up, db2_down
+
+
+@torch.no_grad()
+def sample_ffn_permutation(
+    d_ff: int,
+    seed: int,
+    device: str = "cpu",
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """
+    Return the dense permutation matrix P_ffn ∈ R^{d_ff×d_ff} (matrix form). To ensure deterministic
+    behavior, sample the permutation indices on the CPU and then construct P on the target device.
+    """
+    g = torch.Generator(device="cpu")
+    g.manual_seed(int(seed) & ((1 << 64) - 1))
+    idx_cpu = torch.randperm(d_ff, generator=g, device="cpu")  # [d_ff], long
+
+    eye = torch.eye(d_ff, device=device, dtype=dtype)
+    P_ffn = eye.index_select(0, idx_cpu.to(device))  # P = I[idx]
+    return P_ffn
 
 # Memory Saving Version
 # @torch.no_grad()
