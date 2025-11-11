@@ -19,6 +19,19 @@ from trainer.pum_utils import (
     harmonic_aggregate,
 )
 
+from trainer.utils import (
+    compute_gradascent, 
+    compute_graddiff,
+    compute_dpo,
+    compute_npo,
+    compute_simnpo,
+    compute_satimp,
+    compute_undial,
+    compute_wga,
+    prepare_ref_model,
+)
+
+
 
 @dataclass
 class PUMConfig:
@@ -32,7 +45,7 @@ class PUMConfig:
     # Client Local Unlearning (First-order Small Steps)
     client_method: Literal["GrandAscent", "GradDiff", "DPO", "NPO", "SimNPO", "SatImp", "UnDIAL", "WGA"] = "GrandAscent"
     client_steps: int = 10
-    client_lr: float = 5e-4
+    client_lr: float = 1e-5
 
     # Deterministic Seeds
     s_noise: Optional[List[int]] = None          # Each round s_r
@@ -77,54 +90,160 @@ class PUM:
                 groups.setdefault(f"layer{lid}", []).append(k)
         return groups
 
-    def client_unlearn(self, model_pub, dl_forget, dl_retain=None, ref_model=None, device="cuda"):
+    def client_unlearn(self, ul_model, ul_forget, ul_retain=None, ref_model=None, device="cuda"):
         """
-        Minimalist client inner loop: Runs several steps of GradAscent / GradDiff / NPO /... .
-        This can be directly replaced with the existing dedicated Trainer; a minimal implementation is provided here for independence.
+        Unified client-side inner loop:
+        - Format batches drawn from the dataloader into the input structures expected by the compute_* routines in utils.py.
+        - Delegate loss computation to the compute_* functions in utils.py to avoid duplicating implementations.
+        - Supported methods: ga / graddiff / dpo / npo / simnpo / satimp / undial / wga
         """
-        from trainer.utils import compute_retain_loss, compute_npo_loss
-        
-        optim = torch.optim.AdamW(model_pub.parameters(), lr=self.cfg.client_lr)
-        last = None
-        it_f = iter(dl_forget)
-        it_r = iter(dl_retain) if dl_retain is not None else None
+    
+        def to_device_batch(batch, dev):
+            return {k: v.to(dev) for k, v in batch.items()}
 
-        for _ in range(self.cfg.client_steps):
+        def next_batch(it, dl):
             try:
-                bf = next(it_f)
+                b = next(it)
             except StopIteration:
-                it_f = iter(dl_forget); bf = next(it_f)
-            bf = {k: v.to(device) for k, v in bf.items()}
+                it = iter(dl); b = next(it)
+            return b, it
 
-            if self.cfg.client_method == "ga":
-                out = model_pub(**bf, use_cache=False)
-                loss = -out.loss
-            elif self.cfg.client_method == "graddiff":
-                assert it_r is not None, "[Error] GradDiff method requires retain loader!"
-                try:
-                    br = next(it_r)
-                except StopIteration:
-                    it_r = iter(dl_retain); br = next(it_r)
-                br = {k: v.to(device) for k, v in br.items()}
-                r_loss, _ = compute_retain_loss(model_pub, br, "NLL", ref_model=None)
-                f_out = model_pub(**bf, use_cache=False)
-                loss = -f_out.loss + r_loss
-            elif self.cfg.client_method == "npo":
-                assert ref_model is not None, "[Error] NPO method requires ref_model!"
-                loss, _ = compute_npo_loss(model_pub, ref_model, bf, beta=1.0)
+        # Disable the key-value (KV) cache to avoid unnecessary memory consumption and inadvertent computation-graph interruptions
+        orig_use_cache = getattr(getattr(ul_model, "config", None), "use_cache", None)
+        if orig_use_cache is not None:
+            ul_model.config.use_cache = False
+
+        ul_model.to(device)
+        ul_model.train()
+        optim = torch.optim.AdamW(ul_model.parameters(), lr=self.cfg.client_lr)
+
+        # dataloader 迭代器
+        it_f = iter(ul_forget)
+        it_r = iter(ul_retain) if ul_retain is not None else None
+
+        # Hyperparameters (fall back to defaults defined in the utils functions when not specified in cfg) ----
+        method = str(self.cfg.client_method).lower()
+        retain_loss_type = getattr(self.cfg, "retain_loss_type", "NLL")
+
+        alpha = getattr(self.cfg, "retain_alpha", 1.0)
+        gamma = getattr(self.cfg, "forget_gamma", 1.0)
+
+        dpo_beta    = getattr(self.cfg, "dpo_beta", 0.1)
+        npo_beta    = getattr(self.cfg, "npo_beta", dpo_beta)
+        undial_beta = getattr(self.cfg, "undial_beta", 10.0)
+
+        simnpo_beta  = getattr(self.cfg, "simnpo_beta", 4.5)
+        simnpo_delta = getattr(self.cfg, "simnpo_delta", 0.0)
+
+        wga_beta     = getattr(self.cfg, "wga_beta", 1.0)
+        satimp_beta1 = getattr(self.cfg, "satimp_beta1", 5.0)
+        satimp_beta2 = getattr(self.cfg, "satimp_beta2", 1.0)
+
+        # Lazily construct the teacher (reference) model if required, or reuse an externally provided ref_model ----
+        need_teacher = (method in {"DPO", "NPO", "UnDIAL"}) or (
+            retain_loss_type == "KL" and method in {"GradDiff", "WGA", "SimNPO", "SatImp"}
+        )
+        teacher = ref_model
+        if teacher is None and need_teacher:
+            teacher = prepare_ref_model(ul_model, device=device)
+
+        last = None
+        for _ in range(self.cfg.client_steps):
+            bf, it_f = next_batch(it_f, ul_forget)
+
+            if method == "DPO":
+                assert isinstance(bf, dict) and ("original" in bf and "alternate" in bf), \
+                    "DPO requires {'original': batch, 'alternate': batch}"
+                bf_inputs = {
+                    "original": to_device_batch(bf["original"], device),
+                    "alternate": to_device_batch(bf["alternate"], device),
+                }
+                assert ul_retain is not None, "DPO requires retain dataloader"
+                br, it_r = next_batch(it_r, ul_retain)
+                br_inputs = to_device_batch(br, device)
+                inputs = {"forget": bf_inputs, "retain": br_inputs}
+
             else:
-                raise NotImplementedError(self.cfg.client_method)
+                bf_inputs = to_device_batch(bf, device)
+                if method in {"GradDiff", "NPO", "SimNPO", "SatImp", "UnDIAL", "WGA"}:
+                    assert ul_retain is not None, f"{method} requires retain dataloader"
+                    br, it_r = next_batch(it_r, ul_retain)
+                    br_inputs = to_device_batch(br, device)
+                    inputs = {"forget": bf_inputs, "retain": br_inputs}
+                else:  # "GA"
+                    inputs = {"forget": bf_inputs}
 
+            if method == "GradAscent":
+                loss, _ = compute_gradascent(ul_model, inputs)
+
+            elif method == "GradDiff":
+                loss, _ = compute_graddiff(
+                    ul_model, inputs,
+                    gamma=gamma, alpha=alpha,
+                    retain_loss_type=retain_loss_type,
+                )
+            
+            elif method == "DPO":
+                loss, _ = compute_dpo(
+                    ul_model, inputs,
+                    alpha=alpha, beta=dpo_beta, gamma=gamma,
+                    retain_loss_type=retain_loss_type, ref_model=teacher, device=device,
+                )
+
+            elif method == "SimNPO":
+                loss, _ = compute_simnpo(
+                    ul_model, inputs,
+                    alpha=alpha, beta=simnpo_beta, delta=simnpo_delta, gamma=gamma,
+                    retain_loss_type=retain_loss_type,
+                )
+
+            elif method == "NPO":
+                loss, _ = compute_npo(
+                    ul_model, inputs,
+                    alpha=alpha, beta=npo_beta, gamma=gamma,
+                    retain_loss_type=retain_loss_type, ref_model=teacher, device=device,
+                )
+
+            elif method == "UnDIAL":
+                loss, _ = compute_undial(
+                    ul_model, inputs,
+                    alpha=alpha, beta=undial_beta, gamma=gamma,
+                    retain_loss_type=retain_loss_type, ref_model=teacher, device=device,
+                )
+
+            elif method == "WGA":
+                loss, _ = compute_wga(
+                    ul_model, inputs,
+                    alpha=alpha, beta=wga_beta, gamma=gamma,
+                    retain_loss_type=retain_loss_type,
+                )
+
+            elif method == "SatImp":
+                loss, _ = compute_satimp(
+                    ul_model, inputs,
+                    alpha=alpha, beta1=satimp_beta1, beta2=satimp_beta2, gamma=gamma,
+                    retain_loss_type=retain_loss_type,
+                )
+
+            else:
+                raise NotImplementedError(f"unknown client_method={self.cfg.client_method}")
+
+            # Backpropagation and optimization ---
             optim.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model_pub.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(ul_model.parameters(), 1.0)
             optim.step()
             last = float(loss.detach().cpu())
+
+        # 恢复 use_cache
+        if orig_use_cache is not None:
+            ul_model.config.use_cache = orig_use_cache
+
         return last
 
 
 
-    def run(self, dl_forget, dl_retain=None, ref_model=None, device="cuda", base_sd: OrderedDict = None):
+    def run(self, ul_forget, ul_retain=None, ref_model=None, device="cuda", base_sd: OrderedDict = None):
         self.model.to(device).eval()
 
         # θ_{r-1}
@@ -220,7 +339,7 @@ class PUM:
                 model_k.load_state_dict(pub_sd, strict=False)
 
                 # Line 9–10: The client performs local unlearning steps on D_f (possibly with D_r/ref_model)
-                _ = self.client_unlearn(model_k, dl_forget, dl_retain, ref_model, device=device)
+                _ = self.client_unlearn(model_k, ul_forget, ul_retain, ref_model, device=device)
 
                 # Line 11: Δ' = θ_after - θ_pub
                 after_sd = model_k.state_dict()
@@ -280,7 +399,8 @@ class PUM:
 
                 delta_list.append(delta_prime)
                 alpha_list.append(alphas[k - 1])
-            
+
+
             # Line 12: Harmonic aggregation Δ̄^{(r)} = Harmonic_Aggregate({Δ'^{(k,r)}}, {α_k})
             bar_delta = harmonic_aggregate(delta_list, alpha_list)
             total_sq = torch.stack([ (v.float()**2).sum() for v in bar_delta.values() if torch.is_tensor(v) ]).sum()
