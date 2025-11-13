@@ -95,15 +95,17 @@ def generate_zero_sum_noises(
 
 # Reparameterization: orthogonal / rotation blocks
 def generate_rand_orth_matrix(d: int, gen: torch.Generator, device, dtype):
-    M = torch.randn(d, d, generator=gen, device="cpu", dtype=dtype)
+    M = torch.randn(d, d, generator=gen, device="cpu", dtype=torch.float32)
     Q, R = torch.linalg.qr(M)
     s = torch.sign(torch.diag(R))
+    s = torch.where(s == 0, torch.ones_like(s), s)
     Q = Q @ torch.diag_embed(s)
     return Q.to(device=device, dtype=dtype)
 
 
 def construct_rotation_matrix(theta: torch.Tensor):  # [...]->[...,2,2]
-    c, s = torch.cos(theta), torch.sin(theta)
+    theta32 = theta.to(torch.float32)
+    c, s = torch.cos(theta32), torch.sin(theta32)
     return torch.stack(
         [torch.stack([c, -s], -1), torch.stack([s, c], -1)], -2
     )  # [...,2,2]
@@ -138,18 +140,22 @@ def sample_T_attention(
         if d_h % 2 != 0:
             raise ValueError("RoPE-aware mode requires even d_h.")
         for _ in range(H_KV):
-            thetas_cpu = torch.rand(d_h // 2, generator=gS, device="cpu")
-            R_planes   = construct_rotation_matrix(thetas_cpu).to(device=device, dtype=dtype)
-            S_j        = torch.block_diag(*R_planes.unbind(0))
+            thetas = torch.rand(d_h // 2, generator=gS, device="cpu", dtype=torch.float32) * (2 * math.pi)
+            R_planes = construct_rotation_matrix(thetas)  # [d_h//2, 2, 2] on CPU/FP32
+            S_j = torch.block_diag(*R_planes.unbind(0))   # [d_h, d_h] 仍在 CPU/FP32
             blocks_kv.append(S_j)
     else:
         for _ in range(H_KV):
-            S_j = generate_rand_orth_matrix(d_h, gS, device=device, dtype=dtype)
+            S_j = generate_rand_orth_matrix(d_h, gS, device="cpu", dtype=torch.float32)
             blocks_kv.append(S_j)
 
-    S_KV   = torch.block_diag(*[B.to(device=device, dtype=dtype) for B in blocks_kv])
-    idx    = [min((i * H_KV) // H_Q, H_KV - 1) for i in range(H_Q)]
-    U      = torch.block_diag(*[blocks_kv[j].to(device=device, dtype=dtype) for j in idx])
+    S_KV_cpu = torch.block_diag(*blocks_kv)               # [H_KV*d_h, H_KV*d_h] CPU/FP32
+    idx = [min((i * H_KV) // H_Q, H_KV - 1) for i in range(H_Q)]
+    U_cpu  = torch.block_diag(*[blocks_kv[j] for j in idx])  # [H_Q*d_h, H_Q*d_h] CPU/FP32
+
+    # 统一回到调用方期望的 device/dtype（例如 GPU + bf16/fp16/fp32）
+    U    = U_cpu.to(device=device, dtype=dtype)
+    S_KV = S_KV_cpu.to(device=device, dtype=dtype)
     return U, S_KV
 
 
@@ -266,10 +272,12 @@ def sample_ffn_permutation(
     behavior, sample the permutation indices on the CPU and then construct P on the target device.
     """
     g = torch.Generator(device="cpu")
-    g.manual_seed(int(seed) & ((1<<64)-1))
-    idx = torch.randperm(d_ff, generator=g, device=device)
+    g.manual_seed(int(seed) & ((1 << 64) - 1))
+    idx_cpu = torch.randperm(d_ff, generator=g, device="cpu")
+    idx = idx_cpu.to(device)
+
     P = torch.zeros(d_ff, d_ff, device=device, dtype=dtype)
-    P.scatter_(1, idx.view(-1,1), 1.0)
+    P.scatter_(1, idx.view(-1, 1), 1.0)
     return P
 
 
